@@ -105,22 +105,63 @@ app.post(
       const outPath = path.join(TMP_DIR, outName);
       cleanupPaths.push(outPath);
 
-      const args = buildFfmpegArgs({
-        videoPath: videoFile.path,
-        overlayPath: overlayFile ? overlayFile.path : null,
-        outPath,
-        position,
-        opacity,
-        paddingPct,
-        maxDim,
-        moving,
-        movingSpeed,
-        overlayWidthPct,
-      });
+      const videoInfo = await probeVideoDimensions(videoFile.path);
+      const outputSize = fitDimensionsWithinBounds(videoInfo.width, videoInfo.height, maxDim);
 
-      console.log('[ffmpeg]', args.join(' '));
+      const basePath = path.join(TMP_DIR, `base_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.mp4`);
+      cleanupPaths.push(basePath);
 
-      await runFfmpeg(args);
+      console.log('[ffmpeg][prepare-video]', videoFile.path, '->', `${outputSize.width}x${outputSize.height}`);
+      await runFfmpeg(
+        buildScaledVideoArgs({
+          inputPath: videoFile.path,
+          outPath: basePath,
+          width: outputSize.width,
+          height: outputSize.height,
+        }),
+      );
+
+      let preparedOverlayPath = null;
+      if (overlayFile) {
+        preparedOverlayPath = path.join(
+          TMP_DIR,
+          `overlay_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.png`,
+        );
+        cleanupPaths.push(preparedOverlayPath);
+
+        const overlayWidthPx =
+          overlayWidthPct != null
+            ? makeEven(Math.max(2, Math.round((outputSize.width * overlayWidthPct) / 100)))
+            : null;
+
+        console.log(
+          '[ffmpeg][prepare-overlay]',
+          overlayFile.path,
+          '->',
+          overlayWidthPx ? `${overlayWidthPx}px` : 'native',
+        );
+
+        await runFfmpeg(
+          buildOverlayPrepArgs({
+            inputPath: overlayFile.path,
+            outPath: preparedOverlayPath,
+            opacity,
+            width: overlayWidthPx,
+          }),
+        );
+      }
+
+      await runFfmpeg(
+        buildOverlayCompositeArgs({
+          videoPath: basePath,
+          overlayPath: preparedOverlayPath,
+          outPath,
+          position,
+          paddingPct,
+          moving,
+          movingSpeed,
+        }),
+      );
 
       // Stream do MP4 final
       res.setHeader('Content-Type', 'video/mp4');
@@ -192,61 +233,56 @@ function cleanup(paths) {
 }
 
 /**
- * Constrói os args do ffmpeg.
- *
- * Estratégia:
- *  1. Escala o vídeo respeitando maxDim, mantendo proporção e dimensões pares.
- *  2. Se houver overlay:
- *      - opcional: redimensiona overlay com base em overlayWidthPct (em relação à largura final do vídeo).
- *      - aplica opacity via filtro `format=rgba,colorchannelmixer=aa=<opacity>`.
- *      - posiciona estaticamente OU animado (DVD-bouncing) via expressões abs/mod sobre `t`.
- *  3. Encoda em H.264 + yuv420p + AAC + +faststart.
+ * Monta um pipeline mais robusto em múltiplas etapas para reduzir o risco
+ * de crash em filtros complexos do FFmpeg dentro do container.
  */
-function buildFfmpegArgs(opts) {
-  const {
-    videoPath,
-    overlayPath,
+function buildScaledVideoArgs({ inputPath, outPath, width, height }) {
+  return [
+    '-y',
+    '-i', inputPath,
+    '-map', '0:v:0',
+    '-map', '0:a?',
+    '-vf', `scale=${width}:${height}:flags=lanczos`,
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '20',
+    '-pix_fmt', 'yuv420p',
+    '-movflags', '+faststart',
+    '-c:a', 'aac',
+    '-b:a', '160k',
+    '-threads', '2',
     outPath,
-    position,
-    opacity,
-    paddingPct,
-    maxDim,
-    moving,
-    movingSpeed,
-    overlayWidthPct,
-  } = opts;
+  ];
+}
 
-  // Escala simples: limita o lado maior a maxDim, mantém proporção, força dimensões pares.
-  // Evita expressões `if()` aninhadas que quebram em algumas builds do ffmpeg.
-  const scaleFilter = `scale=w='if(gte(iw,ih),min(${maxDim},iw),-2)':h='if(gte(iw,ih),-2,min(${maxDim},ih))':flags=lanczos,scale='trunc(iw/2)*2':'trunc(ih/2)*2'`;
-
-  const filterParts = [];
-  filterParts.push(`[0:v]${scaleFilter}[base]`);
-
-  if (overlayPath) {
-    // Overlay: aplica opacity. Se overlayWidthPct vier, escala o PNG para % de maxDim
-    // (aproximação — o PNG já vem do front com proporção correta).
-    // Evitamos scale2ref porque ele crasha em algumas builds (corrupted double-linked list).
-    const overlayChain = [`format=rgba`, `colorchannelmixer=aa=${opacity.toFixed(3)}`];
-    if (overlayWidthPct != null) {
-      // Largura final estimada = maxDim * (overlayWidthPct/100). Altura = -2 (proporcional).
-      const targetW = Math.max(2, Math.round((maxDim * overlayWidthPct) / 100));
-      overlayChain.push(`scale=${targetW}:-2:flags=lanczos`);
-    }
-    filterParts.push(`[1:v]${overlayChain.join(',')}[ov]`);
-
-    const { xExpr, yExpr } = overlayPositionExpr({ position, paddingPct, moving, movingSpeed });
-    filterParts.push(`[base][ov]overlay=x='${xExpr}':y='${yExpr}':eof_action=pass:format=auto[outv]`);
-  } else {
-    filterParts.push(`[base]null[outv]`);
+function buildOverlayPrepArgs({ inputPath, outPath, opacity, width }) {
+  const filterParts = ['format=rgba', `colorchannelmixer=aa=${opacity.toFixed(3)}`];
+  if (width != null) {
+    filterParts.push(`scale=${width}:-2:flags=lanczos`);
   }
 
-  const filterComplex = filterParts.join(';');
+  return [
+    '-y',
+    '-i', inputPath,
+    '-vf', filterParts.join(','),
+    '-frames:v', '1',
+    outPath,
+  ];
+}
 
-  const args = ['-y', '-i', videoPath];
-  if (overlayPath) args.push('-i', overlayPath);
+function buildOverlayCompositeArgs({ videoPath, overlayPath, outPath, position, paddingPct, moving, movingSpeed }) {
+  if (!overlayPath) {
+    return ['-y', '-i', videoPath, '-c', 'copy', outPath];
+  }
 
-  args.push(
+  const { xExpr, yExpr } = overlayPositionExpr({ position, paddingPct, moving, movingSpeed });
+  const filterComplex = `[0:v][1:v]overlay=x='${xExpr}':y='${yExpr}':eof_action=pass:format=auto[outv]`;
+
+  return [
+    '-y',
+    '-i', videoPath,
+    '-loop', '1',
+    '-i', overlayPath,
     '-filter_complex', filterComplex,
     '-map', '[outv]',
     '-map', '0:a?',
@@ -255,13 +291,50 @@ function buildFfmpegArgs(opts) {
     '-crf', '20',
     '-pix_fmt', 'yuv420p',
     '-movflags', '+faststart',
-    '-c:a', 'aac',
-    '-b:a', '160k',
+    '-c:a', 'copy',
     '-shortest',
+    '-threads', '2',
     outPath,
-  );
+  ];
+}
 
-  return args;
+function fitDimensionsWithinBounds(width, height, maxDim) {
+  const scale = Math.min(1, maxDim / width, maxDim / height);
+  return {
+    width: makeEven(Math.max(2, Math.round(width * scale))),
+    height: makeEven(Math.max(2, Math.round(height * scale))),
+  };
+}
+
+function makeEven(value) {
+  const rounded = Math.max(2, Math.round(value));
+  return rounded % 2 === 0 ? rounded : rounded - 1;
+}
+
+async function probeVideoDimensions(videoPath) {
+  const { stdout } = await runCommand('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height',
+    '-of', 'json',
+    videoPath,
+  ]);
+
+  let data = {};
+  try {
+    data = JSON.parse(stdout || '{}');
+  } catch {
+    throw new Error('ffprobe retornou JSON inválido');
+  }
+
+  const stream = data?.streams?.[0];
+  const width = int(stream?.width, 0);
+  const height = int(stream?.height, 0);
+  if (!width || !height) {
+    throw new Error('Não foi possível identificar as dimensões do vídeo');
+  }
+
+  return { width, height };
 }
 
 /**
@@ -308,20 +381,41 @@ function overlayPositionExpr({ position, paddingPct, moving, movingSpeed }) {
   return { xExpr, yExpr };
 }
 
-function runFfmpeg(args) {
+async function runFfmpeg(args) {
+  console.log('[ffmpeg]', formatCommand('ffmpeg', args));
+  return runCommand('ffmpeg', args);
+}
+
+function formatCommand(bin, args) {
+  return [bin, ...args].join(' ');
+}
+
+function runCommand(bin, args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
     let stderr = '';
+
+    proc.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
     proc.stderr.on('data', (d) => {
       stderr += d.toString();
     });
     proc.on('error', (err) => reject(err));
-    proc.on('close', (code) => {
-      if (code === 0) resolve();
-      else {
-        console.error('[ffmpeg] exit', code, stderr.slice(-2000));
-        reject(new Error(`ffmpeg exited with code ${code}`));
+    proc.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
       }
+
+      const tail = (stderr || stdout).slice(-4000);
+      console.error(`[${bin}] exit`, code, signal, tail);
+      reject(
+        new Error(
+          `${bin} falhou${code != null ? ` com código ${code}` : ''}${signal ? ` (signal ${signal})` : ''}: ${tail || 'sem stderr'}`,
+        ),
+      );
     });
   });
 }
