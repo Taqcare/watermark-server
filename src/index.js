@@ -216,50 +216,27 @@ function buildFfmpegArgs(opts) {
     overlayWidthPct,
   } = opts;
 
-  // Escala mantendo proporção; força dimensões pares (encoder x264 exige).
-  // Usa min(iw, maxDim) na maior dimensão para não upscalar.
-  const scaleFilter = `scale='if(gt(iw,ih),min(${maxDim},iw),-2)':'if(gt(iw,ih),-2,min(${maxDim},ih))':flags=lanczos,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
+  // Escala simples: limita o lado maior a maxDim, mantém proporção, força dimensões pares.
+  // Evita expressões `if()` aninhadas que quebram em algumas builds do ffmpeg.
+  const scaleFilter = `scale=w='if(gte(iw,ih),min(${maxDim},iw),-2)':h='if(gte(iw,ih),-2,min(${maxDim},ih))':flags=lanczos,scale='trunc(iw/2)*2':'trunc(ih/2)*2'`;
 
   const filterParts = [];
-  // Vídeo base
   filterParts.push(`[0:v]${scaleFilter}[base]`);
 
   if (overlayPath) {
-    // 1) prepara overlay: resize opcional + opacity
-    const overlayChain = [];
+    // Overlay: aplica opacity. Se overlayWidthPct vier, escala o PNG para % de maxDim
+    // (aproximação — o PNG já vem do front com proporção correta).
+    // Evitamos scale2ref porque ele crasha em algumas builds (corrupted double-linked list).
+    const overlayChain = [`format=rgba`, `colorchannelmixer=aa=${opacity.toFixed(3)}`];
     if (overlayWidthPct != null) {
-      // Largura do overlay = overlayWidthPct% da largura do base
-      // Usamos `scale2ref` para referenciar o tamanho do base
-      // Mas é mais simples: usamos `scale=W*pct:-1` referenciando main_w via overlay's filter.
-      // Como `scale` no overlay não tem main_w, fazemos via scale com expressão de tamanho fixo
-      // baseado no maxDim — não ideal. Solução: usar `scale2ref`.
+      // Largura final estimada = maxDim * (overlayWidthPct/100). Altura = -2 (proporcional).
+      const targetW = Math.max(2, Math.round((maxDim * overlayWidthPct) / 100));
+      overlayChain.push(`scale=${targetW}:-2:flags=lanczos`);
     }
-    // Aplica opacity sempre (mesmo 1.0 é ok)
-    overlayChain.push(`format=rgba,colorchannelmixer=aa=${opacity.toFixed(3)}`);
+    filterParts.push(`[1:v]${overlayChain.join(',')}[ov]`);
 
-    if (overlayWidthPct != null) {
-      // Usamos scale2ref para escalar o overlay relativo ao base
-      // [1:v]format=rgba,colorchannelmixer=aa=...[ov0]
-      // [ov0][base]scale2ref=w='iw*pct/100':h='ow/mdar'[ov][base2]
-      filterParts.push(`[1:v]${overlayChain.join(',')}[ov0]`);
-      filterParts.push(
-        `[ov0][base]scale2ref=w='iw*${(overlayWidthPct / 100).toFixed(4)}':h='ow/mdar'[ov][base2]`,
-      );
-    } else {
-      filterParts.push(`[1:v]${overlayChain.join(',')}[ov]`);
-      // base permanece como [base]
-      filterParts.push(`[base]null[base2]`);
-    }
-
-    // Posicionamento
-    const { xExpr, yExpr } = overlayPositionExpr({
-      position,
-      paddingPct,
-      moving,
-      movingSpeed,
-    });
-
-    filterParts.push(`[base2][ov]overlay=x='${xExpr}':y='${yExpr}':format=auto[outv]`);
+    const { xExpr, yExpr } = overlayPositionExpr({ position, paddingPct, moving, movingSpeed });
+    filterParts.push(`[base][ov]overlay=x='${xExpr}':y='${yExpr}':eof_action=pass:format=auto[outv]`);
   } else {
     filterParts.push(`[base]null[outv]`);
   }
