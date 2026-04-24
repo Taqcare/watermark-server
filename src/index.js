@@ -531,6 +531,10 @@ async function runCensorPipeline(jobId, videoFile, params) {
   if (rw > W) rw = makeEven(W);
   if (rh > H) rh = makeEven(H);
 
+  // Raio do canto arredondado — mesma fórmula do preview (cornerRadiusFor):
+  // round(min(rw, rh) * 0.18)
+  const cornerR = Math.max(0, Math.min(Math.floor(Math.min(rw, rh) / 2), Math.round(Math.min(rw, rh) * 0.18)));
+
   let regionFilter;
   if (censorType === 'blur') {
     // CSS blur(N px) ≈ gaussian com sigma=N. Escala com a menor dimensão (mesma fórmula do preview).
@@ -555,9 +559,31 @@ async function runCensorPipeline(jobId, videoFile, params) {
     regionFilter = `scale=${downW}:${downH}:flags=area,scale=${rw}:${rh}:flags=lanczos`;
   }
 
+  // Máscara alpha com cantos arredondados (geq) — mesmo raio visual do preview.
+  // Para cada pixel: dentro do retângulo arredondado → alpha=255; fora → alpha=0.
+  const r = cornerR;
+  const W2 = rw - 1;
+  const H2 = rh - 1;
+  // Centros dos 4 cantos
+  const cx1 = r,            cy1 = r;
+  const cx2 = rw - r - 1,   cy2 = r;
+  const cx3 = r,            cy3 = rh - r - 1;
+  const cx4 = rw - r - 1,   cy4 = rh - r - 1;
+  const inCircle = (cx, cy) => `lte((X-${cx})*(X-${cx})+(Y-${cy})*(Y-${cy}),${r}*${r})`;
+  const alphaExpr = r > 0
+    ? `if(lt(X,${r})*lt(Y,${r}),if(${inCircle(cx1, cy1)},255,0),`
+      + `if(gt(X,${W2 - r})*lt(Y,${r}),if(${inCircle(cx2, cy2)},255,0),`
+      + `if(lt(X,${r})*gt(Y,${H2 - r}),if(${inCircle(cx3, cy3)},255,0),`
+      + `if(gt(X,${W2 - r})*gt(Y,${H2 - r}),if(${inCircle(cx4, cy4)},255,0),255))))`
+    : `255`;
+
+  // Pipeline:
+  //   1. Escala fonte para WxH (resolução final, exatamente igual ao output) e divide.
+  //   2. Recorta a região, aplica filtro (blur/pixel) e adiciona alpha arredondada via geq.
+  //   3. Overlay com format=auto preserva alpha (composição correta dos cantos).
   const filterComplex = [
     `[0:v]scale=${W}:${H}:flags=lanczos,split=2[full][rgn]`,
-    `[rgn]crop=${rw}:${rh}:${rx}:${ry},${regionFilter}[censored]`,
+    `[rgn]crop=${rw}:${rh}:${rx}:${ry},${regionFilter},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='${alphaExpr}'[censored]`,
     `[full][censored]overlay=${rx}:${ry}:format=auto[outv]`,
   ].join(';');
 
