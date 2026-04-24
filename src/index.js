@@ -229,6 +229,55 @@ app.post('/jobs-from-url', async (req, res) => {
   }
 });
 
+// ---- POST /jobs-from-url-censor ---- async: aplica blur/pixel em região retangular do vídeo
+// Body JSON: {
+//   videoUrl: string, videoName?: string,
+//   region: { x, y, w, h },        // normalizado 0..1
+//   censorType: 'blur'|'pixel',
+//   intensity: 'leve'|'medio'|'pesado'
+// }
+app.post('/jobs-from-url-censor', async (req, res) => {
+  try {
+    const { videoUrl, videoName, region, censorType, intensity } = req.body || {};
+    if (!videoUrl || typeof videoUrl !== 'string') {
+      return res.status(400).json({ error: 'missing videoUrl' });
+    }
+    if (!region || typeof region !== 'object') {
+      return res.status(400).json({ error: 'missing region' });
+    }
+    const ct = censorType === 'pixel' ? 'pixel' : 'blur';
+    const it = ['leve', 'medio', 'pesado'].includes(intensity) ? intensity : 'medio';
+
+    const safeVideoName = (videoName || 'video.mp4').replace(/[^\w.\-]/g, '_');
+    const jobId = newJob(safeVideoName);
+    const job = jobs.get(jobId);
+    job.kind = 'censor';
+
+    console.log(`[job ${jobId}] 📡 censor-from-url: video="${safeVideoName}" type=${ct} intensity=${it}`);
+
+    setImmediate(async () => {
+      try {
+        const videoPath = path.join(TMP_DIR, `${Date.now()}_${crypto.randomBytes(8).toString('hex')}_${safeVideoName}`);
+        job.cleanupPaths.push(videoPath);
+        const tDl = Date.now();
+        const videoBytes = await downloadToFile(videoUrl, videoPath, MAX_FILE_MB * 1024 * 1024);
+        console.log(`[job ${jobId}] ⬇ video baixado em ${Date.now() - tDl}ms (${(videoBytes / 1024 / 1024).toFixed(2)}MB)`);
+
+        const videoFile = { path: videoPath, originalname: safeVideoName, size: videoBytes };
+        await runCensorPipeline(jobId, videoFile, { region, censorType: ct, intensity: it });
+      } catch (err) {
+        console.error(`[job ${jobId}] 💥 censor-from-url`, err?.message || err);
+        updateJob(jobId, { status: 'error', error: err?.message || 'internal error' });
+      }
+    });
+
+    res.status(202).json({ jobId });
+  } catch (err) {
+    console.error('jobs-from-url-censor error', err);
+    res.status(500).json({ error: err?.message || 'internal error' });
+  }
+});
+
 // ---- GET /jobs/:id ----
 app.get('/jobs/:id', (req, res) => {
   const j = jobs.get(req.params.id);
@@ -429,6 +478,118 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
   }
 
   log(`🎉 done total=${Date.now() - t0}ms`);
+
+  updateJob(jobId, { status: 'done', outPath, sizeBytes: finalSize, resultUrl, resultPath });
+}
+
+// ---------------- censor pipeline ----------------
+
+const CENSOR_BLUR_RADIUS = { leve: 8, medio: 16, pesado: 32 };
+const CENSOR_PIXEL_FACTOR = { leve: 0.012, medio: 0.025, pesado: 0.045 };
+
+async function runCensorPipeline(jobId, videoFile, params) {
+  const log = (...a) => console.log(`[job ${jobId}]`, ...a);
+  const logErr = (...a) => console.error(`[job ${jobId}]`, ...a);
+  const t0 = Date.now();
+  const job = jobs.get(jobId);
+  if (!job) throw new Error('job desapareceu');
+
+  updateJob(jobId, { status: 'processing' });
+
+  const region = {
+    x: clamp(num(params.region?.x, 0), 0, 1),
+    y: clamp(num(params.region?.y, 0), 0, 1),
+    w: clamp(num(params.region?.w, 1), 0.001, 1),
+    h: clamp(num(params.region?.h, 1), 0.001, 1),
+  };
+  const censorType = params.censorType === 'pixel' ? 'pixel' : 'blur';
+  const intensity = ['leve', 'medio', 'pesado'].includes(params.intensity) ? params.intensity : 'medio';
+
+  const videoSizeMB = (videoFile.size / 1024 / 1024).toFixed(2);
+  log(`📥 censor input: video="${videoFile.originalname}" size=${videoSizeMB}MB type=${censorType} intensity=${intensity} region=${JSON.stringify(region)}`);
+
+  const tProbe = Date.now();
+  let videoInfo;
+  try { videoInfo = await probeVideoInfo(videoFile.path); }
+  catch (e) { throw new Error(`Falha ao analisar o vídeo: ${e.message}`); }
+  const outputSize = fitDimensionsWithinBounds(videoInfo.width, videoInfo.height, 1920);
+  log(`🔍 probe (${Date.now() - tProbe}ms): ${videoInfo.width}x${videoInfo.height} hasAudio=${videoInfo.hasAudio} -> ${outputSize.width}x${outputSize.height}`);
+
+  const W = outputSize.width;
+  const H = outputSize.height;
+  let rw = makeEven(Math.max(2, Math.round(W * region.w)));
+  let rh = makeEven(Math.max(2, Math.round(H * region.h)));
+  let rx = Math.max(0, Math.min(W - rw, Math.round(W * region.x)));
+  let ry = Math.max(0, Math.min(H - rh, Math.round(H * region.y)));
+  rx = Math.floor(rx / 2) * 2;
+  ry = Math.floor(ry / 2) * 2;
+  if (rw > W) rw = makeEven(W);
+  if (rh > H) rh = makeEven(H);
+
+  let regionFilter;
+  if (censorType === 'blur') {
+    const radius = CENSOR_BLUR_RADIUS[intensity];
+    regionFilter = `boxblur=lr=${radius}:lp=2:cr=${radius}:cp=2`;
+  } else {
+    const factor = CENSOR_PIXEL_FACTOR[intensity];
+    const longer = Math.max(rw, rh);
+    const blockPx = Math.max(6, Math.round(longer * factor));
+    const downW = Math.max(1, Math.round(rw / blockPx));
+    const downH = Math.max(1, Math.round(rh / blockPx));
+    regionFilter = `scale=${downW}:${downH}:flags=area,scale=${rw}:${rh}:flags=lanczos`;
+  }
+
+  const filterComplex = [
+    `[0:v]scale=${W}:${H}:flags=lanczos,split=2[full][rgn]`,
+    `[rgn]crop=${rw}:${rh}:${rx}:${ry},${regionFilter}[censored]`,
+    `[full][censored]overlay=${rx}:${ry}:format=auto[outv]`,
+  ].join(';');
+
+  const outPath = path.join(TMP_DIR, `censor_out_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.mp4`);
+  job.cleanupPaths.push(outPath);
+
+  const args = ['-y', '-i', videoFile.path, '-filter_complex', filterComplex, '-map', '[outv]'];
+  if (videoInfo.hasAudio) args.push('-map', '0:a:0?');
+  args.push(
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+    '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+    '-max_muxing_queue_size', '1024',
+  );
+  if (videoInfo.hasAudio) args.push('-c:a', 'aac', '-b:a', '160k');
+  else args.push('-an');
+  args.push('-threads', '2', outPath);
+
+  const tComp = Date.now();
+  try {
+    await runFfmpeg(args, { tag: `${jobId}/censor` });
+  } catch (e) { throw new Error(`Falha ao aplicar censura: ${e.message}`); }
+  const finalSize = safeSize(outPath);
+  log(`✅ censor (${Date.now() - tComp}ms): ${(finalSize / 1024 / 1024).toFixed(2)}MB`);
+
+  let resultUrl = null;
+  let resultPath = null;
+  if (supabaseAdmin) {
+    try {
+      const tUp = Date.now();
+      const safeName = sanitizeName(videoFile.originalname);
+      resultPath = `_censor-results/${jobId}/censored_${safeName}.mp4`;
+      const fileBuffer = fs.readFileSync(outPath);
+      const up = await supabaseAdmin.storage
+        .from(SUPABASE_RESULT_BUCKET)
+        .upload(resultPath, fileBuffer, { contentType: 'video/mp4', upsert: true });
+      if (up.error) throw up.error;
+      const signed = await supabaseAdmin.storage
+        .from(SUPABASE_RESULT_BUCKET)
+        .createSignedUrl(resultPath, SUPABASE_RESULT_TTL_SECONDS);
+      if (signed.error || !signed.data?.signedUrl) throw signed.error || new Error('signed url ausente');
+      resultUrl = signed.data.signedUrl;
+      log(`☁ uploaded censor result to Supabase (${Date.now() - tUp}ms): ${resultPath}`);
+    } catch (e) {
+      logErr('⚠ falha no upload Supabase (resultado ficará disponível via /jobs/:id/result):', e?.message || e);
+    }
+  }
+
+  log(`🎉 censor done total=${Date.now() - t0}ms`);
 
   updateJob(jobId, { status: 'done', outPath, sizeBytes: finalSize, resultUrl, resultPath });
 }
