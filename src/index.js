@@ -484,7 +484,11 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
 
 // ---------------- censor pipeline ----------------
 
-const CENSOR_BLUR_RADIUS = { leve: 8, medio: 16, pesado: 32 };
+// Mesmos valores do frontend (src/pages/GeradorPreview.tsx — INTENSITY_BLUR).
+// O preview aplica CSS `blur(blurPx)` com blurPx = round(INTENSITY_BLUR * min(W,H) / 720)
+// CSS blur() é gaussiano, então usamos `gblur` no FFmpeg com sigma equivalente.
+const CENSOR_BLUR_BASE = { leve: 12, medio: 24, pesado: 48 };
+// Mesmos valores do frontend (INTENSITY_PIXEL).
 const CENSOR_PIXEL_FACTOR = { leve: 0.012, medio: 0.025, pesado: 0.045 };
 
 async function runCensorPipeline(jobId, videoFile, params) {
@@ -517,25 +521,37 @@ async function runCensorPipeline(jobId, videoFile, params) {
 
   const W = outputSize.width;
   const H = outputSize.height;
+  // Coordenadas EXATAS da região, espelhando o frontend (Math.round em sw/sh).
+  // FFmpeg crop/overlay aceitam offsets ímpares; só largura/altura do crop precisam ser pares
+  // quando usamos overlay com formato yuv420p, então arredondamos APENAS rw/rh para par.
   let rw = makeEven(Math.max(2, Math.round(W * region.w)));
   let rh = makeEven(Math.max(2, Math.round(H * region.h)));
   let rx = Math.max(0, Math.min(W - rw, Math.round(W * region.x)));
   let ry = Math.max(0, Math.min(H - rh, Math.round(H * region.y)));
-  rx = Math.floor(rx / 2) * 2;
-  ry = Math.floor(ry / 2) * 2;
   if (rw > W) rw = makeEven(W);
   if (rh > H) rh = makeEven(H);
 
   let regionFilter;
   if (censorType === 'blur') {
-    const radius = CENSOR_BLUR_RADIUS[intensity];
-    regionFilter = `boxblur=lr=${radius}:lp=2:cr=${radius}:cp=2`;
+    // CSS blur(N px) ≈ gaussian com sigma=N. Escala com a menor dimensão (mesma fórmula do preview).
+    const sigma = Math.max(1, Math.round((CENSOR_BLUR_BASE[intensity] * Math.min(W, H)) / 720));
+    // gblur tem limite de sigma por step ≈ 50; encadeia múltiplas passes se necessário.
+    const STEP = 30;
+    const passes = [];
+    let remaining = sigma;
+    while (remaining > 0) {
+      const s = Math.min(STEP, remaining);
+      passes.push(`gblur=sigma=${s}:steps=2`);
+      remaining -= s;
+    }
+    regionFilter = passes.join(',');
   } else {
     const factor = CENSOR_PIXEL_FACTOR[intensity];
     const longer = Math.max(rw, rh);
     const blockPx = Math.max(6, Math.round(longer * factor));
     const downW = Math.max(1, Math.round(rw / blockPx));
     const downH = Math.max(1, Math.round(rh / blockPx));
+    // Mesma técnica do preview: downscale (area/bilinear) + upscale com smoothing alto (lanczos)
     regionFilter = `scale=${downW}:${downH}:flags=area,scale=${rw}:${rh}:flags=lanczos`;
   }
 
