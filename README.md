@@ -22,22 +22,32 @@ Watermark Server (Node + Express)
 ## Endpoints
 
 - `GET /health` — health check
-- `POST /process` — multipart:
-  - `video` (file, obrigatório)
-  - `overlay` (file PNG, opcional)
-  - `config` (string JSON):
-    ```json
-    {
-      "position": "center",
-      "opacity": 0.3,
-      "paddingPct": 0.02,
-      "maxDim": 1920,
-      "moving": false,
-      "movingSpeed": 20,
-      "overlayWidthPct": 20
-    }
-    ```
-  - resposta: `video/mp4` binário
+- `POST /process` — multipart síncrono (legado): `video` + `overlay` + `config` JSON
+- `POST /jobs` — multipart assíncrono (mesmos campos) → `{ jobId }`
+- `POST /jobs-from-url` — JSON assíncrono (Supabase signed URLs):
+  ```json
+  {
+    "videoUrl": "https://...signed",
+    "videoName": "video.mp4",
+    "overlayUrl": "https://...signed-or-null",
+    "config": { "position": "center", "opacity": 0.3, "moving": false }
+  }
+  ```
+  → `{ jobId }`
+- `POST /jobs-from-url-censor` — JSON assíncrono (censura blur/pixel em região retangular):
+  ```json
+  {
+    "videoUrl": "https://...signed",
+    "videoName": "video.mp4",
+    "region": { "x": 0, "y": 0, "w": 1, "h": 0.5 },
+    "censorType": "blur",
+    "intensity": "medio"
+  }
+  ```
+  → `{ jobId }`
+- `GET /jobs/:id` — `{ status, error?, sizeBytes?, resultUrl?, resultPath?, ageMs }`
+- `GET /jobs/:id/result` — baixa MP4 (fallback se Supabase não configurado)
+
 
 ## Variáveis de ambiente
 
