@@ -19,7 +19,11 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
 const { spawn } = require('child_process');
+const { createClient } = require('@supabase/supabase-js');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -27,11 +31,23 @@ const MAX_FILE_MB = parseInt(process.env.MAX_FILE_MB || '300', 10);
 const TMP_DIR = process.env.TMP_DIR || path.join(os.tmpdir(), 'watermark');
 const JOB_TTL_MS = parseInt(process.env.JOB_TTL_MS || String(60 * 60 * 1000), 10); // 1h
 
+// Supabase (para upload do MP4 resultado de volta ao Storage e bypass do proxy)
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const SUPABASE_RESULT_BUCKET = process.env.SUPABASE_RESULT_BUCKET || 'temp-uploads';
+const SUPABASE_RESULT_TTL_SECONDS = parseInt(process.env.SUPABASE_RESULT_TTL_SECONDS || '3600', 10);
+const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  : null;
+if (!supabaseAdmin) {
+  console.warn('[watermark-server] ⚠ SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY não configurados — fallback para download via /jobs/:id/result');
+}
+
 fs.mkdirSync(TMP_DIR, { recursive: true });
 
 const app = express();
 app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',').map((s) => s.trim()) }));
-
+app.use(express.json({ limit: '1mb' }));
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, TMP_DIR),
   filename: (_req, file, cb) => {
@@ -160,6 +176,59 @@ app.post(
   },
 );
 
+// ---- POST /jobs-from-url ---- async: aceita URLs (Supabase Storage signed URLs)
+// Body JSON: { videoUrl: string, videoName?: string, overlayUrl?: string|null, config: object }
+app.post('/jobs-from-url', async (req, res) => {
+  try {
+    const { videoUrl, videoName, overlayUrl, config } = req.body || {};
+    if (!videoUrl || typeof videoUrl !== 'string') {
+      return res.status(400).json({ error: 'missing videoUrl' });
+    }
+    if (config && typeof config !== 'object') {
+      return res.status(400).json({ error: 'invalid config' });
+    }
+
+    const safeVideoName = (videoName || 'video.mp4').replace(/[^\w.\-]/g, '_');
+    const jobId = newJob(safeVideoName);
+    const job = jobs.get(jobId);
+
+    console.log(`[job ${jobId}] 📡 from-url: video="${safeVideoName}" overlay=${overlayUrl ? 'yes' : 'no'}`);
+
+    // download síncrono mas rápido (resposta volta após download iniciar). Para manter API consistente com /jobs,
+    // baixamos em background e respondemos jobId imediatamente.
+    setImmediate(async () => {
+      try {
+        const videoPath = path.join(TMP_DIR, `${Date.now()}_${crypto.randomBytes(8).toString('hex')}_${safeVideoName}`);
+        job.cleanupPaths.push(videoPath);
+        const tDl = Date.now();
+        const videoBytes = await downloadToFile(videoUrl, videoPath, MAX_FILE_MB * 1024 * 1024);
+        console.log(`[job ${jobId}] ⬇ video baixado em ${Date.now() - tDl}ms (${(videoBytes / 1024 / 1024).toFixed(2)}MB)`);
+
+        let overlayFile = null;
+        if (overlayUrl) {
+          const overlayPath = path.join(TMP_DIR, `${Date.now()}_${crypto.randomBytes(8).toString('hex')}_overlay.png`);
+          job.cleanupPaths.push(overlayPath);
+          const tOv = Date.now();
+          const overlayBytes = await downloadToFile(overlayUrl, overlayPath, 50 * 1024 * 1024);
+          console.log(`[job ${jobId}] ⬇ overlay baixado em ${Date.now() - tOv}ms (${(overlayBytes / 1024).toFixed(1)}KB)`);
+          overlayFile = { path: overlayPath, originalname: 'overlay.png', size: overlayBytes };
+        }
+
+        const videoFile = { path: videoPath, originalname: safeVideoName, size: videoBytes };
+        await runPipeline(jobId, videoFile, overlayFile, config || {});
+      } catch (err) {
+        console.error(`[job ${jobId}] 💥 from-url`, err?.message || err);
+        updateJob(jobId, { status: 'error', error: err?.message || 'internal error' });
+      }
+    });
+
+    res.status(202).json({ jobId });
+  } catch (err) {
+    console.error('jobs-from-url error', err);
+    res.status(500).json({ error: err?.message || 'internal error' });
+  }
+});
+
 // ---- GET /jobs/:id ----
 app.get('/jobs/:id', (req, res) => {
   const j = jobs.get(req.params.id);
@@ -169,6 +238,8 @@ app.get('/jobs/:id', (req, res) => {
     error: j.error || null,
     sizeBytes: j.sizeBytes || null,
     originalName: j.originalName || null,
+    resultUrl: j.resultUrl || null,
+    resultPath: j.resultPath || null,
     ageMs: Date.now() - j.createdAt,
   });
 });
@@ -332,9 +403,34 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
 
   const finalSize = safeSize(outPath);
   log(`✅ composite (${Date.now() - tComp}ms): ${(finalSize / 1024 / 1024).toFixed(2)}MB`);
+
+  // Upload do resultado para o Supabase Storage (bypass do proxy do Easypanel no caminho de volta)
+  let resultUrl = null;
+  let resultPath = null;
+  if (supabaseAdmin) {
+    try {
+      const tUp = Date.now();
+      const safeName = sanitizeName(videoFile.originalname);
+      resultPath = `_watermark-results/${jobId}/watermarked_${safeName}.mp4`;
+      const fileBuffer = fs.readFileSync(outPath);
+      const up = await supabaseAdmin.storage
+        .from(SUPABASE_RESULT_BUCKET)
+        .upload(resultPath, fileBuffer, { contentType: 'video/mp4', upsert: true });
+      if (up.error) throw up.error;
+      const signed = await supabaseAdmin.storage
+        .from(SUPABASE_RESULT_BUCKET)
+        .createSignedUrl(resultPath, SUPABASE_RESULT_TTL_SECONDS);
+      if (signed.error || !signed.data?.signedUrl) throw signed.error || new Error('signed url ausente');
+      resultUrl = signed.data.signedUrl;
+      log(`☁ uploaded result to Supabase (${Date.now() - tUp}ms): ${resultPath}`);
+    } catch (e) {
+      logErr('⚠ falha no upload Supabase (resultado ficará disponível via /jobs/:id/result):', e?.message || e);
+    }
+  }
+
   log(`🎉 done total=${Date.now() - t0}ms`);
 
-  updateJob(jobId, { status: 'done', outPath, sizeBytes: finalSize });
+  updateJob(jobId, { status: 'done', outPath, sizeBytes: finalSize, resultUrl, resultPath });
 }
 
 // ---------------- helpers ----------------
@@ -345,6 +441,53 @@ function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 function sanitizeName(name) { return (name || 'video').replace(/\.[^.]+$/, '').replace(/[^\w.\-]/g, '_').slice(0, 80); }
 function safeSize(p) { try { return fs.statSync(p).size; } catch { return 0; } }
 function cleanup(paths) { for (const p of paths) { if (!p) continue; fs.unlink(p, () => {}); } }
+
+/**
+ * Baixa um arquivo de uma URL (http/https) para `destPath`. Segue até 5 redirects.
+ * Aborta se o tamanho exceder `maxBytes`. Retorna o número de bytes salvos.
+ */
+function downloadToFile(url, destPath, maxBytes, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(url); } catch { return reject(new Error(`URL inválida: ${url}`)); }
+    const lib = parsed.protocol === 'http:' ? http : https;
+    const req = lib.get(parsed, (res) => {
+      // redirects
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        if (redirectsLeft <= 0) return reject(new Error('Excesso de redirects'));
+        const next = new URL(res.headers.location, parsed).toString();
+        return resolve(downloadToFile(next, destPath, maxBytes, redirectsLeft - 1));
+      }
+      if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        return reject(new Error(`Download HTTP ${res.statusCode} em ${parsed.hostname}`));
+      }
+      const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+      if (contentLength && contentLength > maxBytes) {
+        res.resume();
+        return reject(new Error(`Arquivo excede limite (${(contentLength / 1024 / 1024).toFixed(1)}MB > ${(maxBytes / 1024 / 1024).toFixed(0)}MB)`));
+      }
+      let bytes = 0;
+      const ws = fs.createWriteStream(destPath);
+      res.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > maxBytes) {
+          ws.destroy();
+          res.destroy();
+          fs.unlink(destPath, () => {});
+          reject(new Error(`Arquivo excedeu ${(maxBytes / 1024 / 1024).toFixed(0)}MB durante download`));
+        }
+      });
+      res.pipe(ws);
+      ws.on('finish', () => resolve(bytes));
+      ws.on('error', reject);
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(120_000, () => { req.destroy(new Error('Download timeout (120s)')); });
+  });
+}
 
 function buildScaledVideoArgs({ inputPath, outPath, width, height, hasAudio }) {
   const args = ['-y', '-i', inputPath, '-map', '0:v:0'];
