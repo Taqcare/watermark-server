@@ -26,9 +26,11 @@ const { spawn } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 // archiver removido — cortes agora são concatenados em 1 MP4
 
+const MAX_FILE_MB = parseInt(process.env.MAX_FILE_MB || '2048', 10);
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const MAX_FILE_MB = parseInt(process.env.MAX_FILE_MB || '300', 10);
+const MAX_VIDEO_SIZE_BYTES = 2048 * 1024 * 1024; // 2GB
+const MAX_VIDEO_SIZE_LABEL = '2GB';
 const TMP_DIR = process.env.TMP_DIR || path.join(os.tmpdir(), 'watermark');
 const JOB_TTL_MS = parseInt(process.env.JOB_TTL_MS || String(60 * 60 * 1000), 10); // 1h
 
