@@ -24,6 +24,7 @@ const http = require('http');
 const { URL } = require('url');
 const { spawn } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
+const archiver = require('archiver');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -278,7 +279,57 @@ app.post('/jobs-from-url-censor', async (req, res) => {
   }
 });
 
-// ---- GET /jobs/:id ----
+// ---- POST /jobs-from-url-cut ---- corta o vídeo em 1 ou mais segmentos
+// Body JSON: { videoUrl: string, videoName?: string, segments: [{start: number, end: number}] }
+// Resultado: 1 segmento => MP4; vários => ZIP com todos os MP4s.
+app.post('/jobs-from-url-cut', async (req, res) => {
+  try {
+    const { videoUrl, videoName, segments } = req.body || {};
+    if (!videoUrl || typeof videoUrl !== 'string') {
+      return res.status(400).json({ error: 'missing videoUrl' });
+    }
+    if (!Array.isArray(segments) || segments.length === 0) {
+      return res.status(400).json({ error: 'missing segments' });
+    }
+    const cleanSegments = [];
+    for (const s of segments) {
+      const start = num(s?.start, NaN);
+      const end = num(s?.end, NaN);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || start < 0) {
+        return res.status(400).json({ error: 'invalid segment: end must be > start >= 0' });
+      }
+      cleanSegments.push({ start, end });
+    }
+
+    const safeVideoName = (videoName || 'video.mp4').replace(/[^\w.\-]/g, '_');
+    const jobId = newJob(safeVideoName);
+    const job = jobs.get(jobId);
+    job.kind = 'cut';
+
+    console.log(`[job ${jobId}] 📡 cut-from-url: video="${safeVideoName}" segments=${cleanSegments.length}`);
+
+    setImmediate(async () => {
+      try {
+        const videoPath = path.join(TMP_DIR, `${Date.now()}_${crypto.randomBytes(8).toString('hex')}_${safeVideoName}`);
+        job.cleanupPaths.push(videoPath);
+        const tDl = Date.now();
+        const videoBytes = await downloadToFile(videoUrl, videoPath, MAX_FILE_MB * 1024 * 1024);
+        console.log(`[job ${jobId}] ⬇ video baixado em ${Date.now() - tDl}ms (${(videoBytes / 1024 / 1024).toFixed(2)}MB)`);
+        const videoFile = { path: videoPath, originalname: safeVideoName, size: videoBytes };
+        await runCutPipeline(jobId, videoFile, cleanSegments);
+      } catch (err) {
+        console.error(`[job ${jobId}] 💥 cut-from-url`, err?.message || err);
+        updateJob(jobId, { status: 'error', error: err?.message || 'internal error' });
+      }
+    });
+
+    res.status(202).json({ jobId });
+  } catch (err) {
+    console.error('jobs-from-url-cut error', err);
+    res.status(500).json({ error: err?.message || 'internal error' });
+  }
+});
+
 app.get('/jobs/:id', (req, res) => {
   const j = jobs.get(req.params.id);
   if (!j) return res.status(404).json({ error: 'job not found' });
@@ -289,6 +340,8 @@ app.get('/jobs/:id', (req, res) => {
     originalName: j.originalName || null,
     resultUrl: j.resultUrl || null,
     resultPath: j.resultPath || null,
+    isZip: !!j.isZip,
+    kind: j.kind || null,
     ageMs: Date.now() - j.createdAt,
   });
 });
@@ -301,11 +354,11 @@ app.get('/jobs/:id/result', (req, res) => {
     return res.status(409).json({ error: `job not ready (status=${j.status})` });
   }
   const size = safeSize(j.outPath);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader(
-    'Content-Disposition',
-    `attachment; filename="watermarked_${sanitizeName(j.originalName || 'video')}.mp4"`,
-  );
+  const isZip = !!j.isZip;
+  const baseName = sanitizeName(j.originalName || 'video');
+  const filename = isZip ? `cortes_${baseName}.zip` : (j.kind === 'cut' ? `corte_${baseName}.mp4` : `watermarked_${baseName}.mp4`);
+  res.setHeader('Content-Type', isZip ? 'application/zip' : 'video/mp4');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('Content-Length', size);
   const stream = fs.createReadStream(j.outPath);
   stream.on('end', () => {
@@ -487,9 +540,9 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
 // Mesmos valores do frontend (src/pages/GeradorPreview.tsx — INTENSITY_BLUR).
 // O preview aplica CSS `blur(blurPx)` com blurPx = round(INTENSITY_BLUR * min(W,H) / 720)
 // CSS blur() é gaussiano, então usamos `gblur` no FFmpeg com sigma equivalente.
-const CENSOR_BLUR_BASE = { leve: 12, medio: 24, pesado: 48 };
+const CENSOR_BLUR_BASE = { leve: 24, medio: 48, pesado: 96 };
 // Mesmos valores do frontend (INTENSITY_PIXEL).
-const CENSOR_PIXEL_FACTOR = { leve: 0.012, medio: 0.025, pesado: 0.045 };
+const CENSOR_PIXEL_FACTOR = { leve: 0.025, medio: 0.05, pesado: 0.09 };
 
 async function runCensorPipeline(jobId, videoFile, params) {
   const log = (...a) => console.log(`[job ${jobId}]`, ...a);
@@ -634,6 +687,122 @@ async function runCensorPipeline(jobId, videoFile, params) {
   log(`🎉 censor done total=${Date.now() - t0}ms`);
 
   updateJob(jobId, { status: 'done', outPath, sizeBytes: finalSize, resultUrl, resultPath });
+}
+
+// ---------------- cut pipeline ----------------
+
+async function runCutPipeline(jobId, videoFile, segments) {
+  const log = (...a) => console.log(`[job ${jobId}]`, ...a);
+  const logErr = (...a) => console.error(`[job ${jobId}]`, ...a);
+  const t0 = Date.now();
+  const job = jobs.get(jobId);
+  if (!job) throw new Error('job desapareceu');
+
+  updateJob(jobId, { status: 'processing' });
+
+  const videoSizeMB = (videoFile.size / 1024 / 1024).toFixed(2);
+  log(`📥 cut input: video="${videoFile.originalname}" size=${videoSizeMB}MB segments=${segments.length}`);
+
+  let probeInfo;
+  try { probeInfo = await probeVideoInfo(videoFile.path); }
+  catch (e) { throw new Error(`Falha ao analisar o vídeo: ${e.message}`); }
+  log(`🔍 probe: ${probeInfo.width}x${probeInfo.height} hasAudio=${probeInfo.hasAudio}`);
+
+  const baseName = sanitizeName(videoFile.originalname);
+  const segPaths = [];
+
+  // 1) Cut each segment individually (re-encode for frame-precise cuts)
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const dur = seg.end - seg.start;
+    const segOut = path.join(TMP_DIR, `cut_${jobId}_${i + 1}_${crypto.randomBytes(3).toString('hex')}.mp4`);
+    job.cleanupPaths.push(segOut);
+
+    const args = [
+      '-y',
+      '-ss', seg.start.toFixed(3),
+      '-i', videoFile.path,
+      '-t', dur.toFixed(3),
+      '-map', '0:v:0',
+    ];
+    if (probeInfo.hasAudio) args.push('-map', '0:a:0?');
+    args.push(
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+      '-max_muxing_queue_size', '1024',
+    );
+    if (probeInfo.hasAudio) args.push('-c:a', 'aac', '-b:a', '160k');
+    else args.push('-an');
+    args.push('-threads', '2', segOut);
+
+    const tSeg = Date.now();
+    try {
+      await runFfmpeg(args, { tag: `${jobId}/cut-${i + 1}` });
+    } catch (e) {
+      throw new Error(`Falha ao cortar segmento ${i + 1}: ${e.message}`);
+    }
+    log(`✅ segment ${i + 1}/${segments.length} (${Date.now() - tSeg}ms): ${(safeSize(segOut) / 1024 / 1024).toFixed(2)}MB`);
+    segPaths.push(segOut);
+  }
+
+  // 2) Concatenate all segments into a single MP4
+  let finalOutPath;
+
+  if (segPaths.length === 1) {
+    // Only one segment — no concat needed
+    finalOutPath = segPaths[0];
+  } else {
+    // Build concat list file for ffmpeg demuxer
+    const concatListPath = path.join(TMP_DIR, `concat_${jobId}_${crypto.randomBytes(4).toString('hex')}.txt`);
+    job.cleanupPaths.push(concatListPath);
+    const listContent = segPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
+    fs.writeFileSync(concatListPath, listContent);
+
+    finalOutPath = path.join(TMP_DIR, `merged_${jobId}_${crypto.randomBytes(4).toString('hex')}.mp4`);
+    job.cleanupPaths.push(finalOutPath);
+
+    const tConcat = Date.now();
+    try {
+      // Since all segments were re-encoded with the same codec/settings, we can use
+      // concat demuxer with stream copy (very fast, no re-encoding needed).
+      await runFfmpeg([
+        '-y', '-f', 'concat', '-safe', '0', '-i', concatListPath,
+        '-c', 'copy', '-movflags', '+faststart',
+        finalOutPath,
+      ], { tag: `${jobId}/concat` });
+    } catch (e) {
+      throw new Error(`Falha ao unir segmentos: ${e.message}`);
+    }
+    log(`🔗 concat (${Date.now() - tConcat}ms): ${segPaths.length} parts -> ${(safeSize(finalOutPath) / 1024 / 1024).toFixed(2)}MB`);
+  }
+
+  const finalSize = safeSize(finalOutPath);
+
+  // 3) Upload do resultado para o Supabase Storage (bypass do proxy)
+  let resultUrl = null;
+  let resultPath = null;
+  if (supabaseAdmin) {
+    try {
+      const tUp = Date.now();
+      resultPath = `_cut-results/${jobId}/corte_${baseName}.mp4`;
+      const fileBuffer = fs.readFileSync(finalOutPath);
+      const up = await supabaseAdmin.storage
+        .from(SUPABASE_RESULT_BUCKET)
+        .upload(resultPath, fileBuffer, { contentType: 'video/mp4', upsert: true });
+      if (up.error) throw up.error;
+      const signed = await supabaseAdmin.storage
+        .from(SUPABASE_RESULT_BUCKET)
+        .createSignedUrl(resultPath, SUPABASE_RESULT_TTL_SECONDS);
+      if (signed.error || !signed.data?.signedUrl) throw signed.error || new Error('signed url ausente');
+      resultUrl = signed.data.signedUrl;
+      log(`☁ uploaded cut result to Supabase (${Date.now() - tUp}ms): ${resultPath}`);
+    } catch (e) {
+      logErr('⚠ falha no upload Supabase (resultado via /jobs/:id/result):', e?.message || e);
+    }
+  }
+
+  log(`🎉 cut done total=${Date.now() - t0}ms`);
+  updateJob(jobId, { status: 'done', outPath: finalOutPath, sizeBytes: finalSize, resultUrl, resultPath });
 }
 
 // ---------------- helpers ----------------
