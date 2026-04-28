@@ -24,7 +24,7 @@ const http = require('http');
 const { URL } = require('url');
 const { spawn } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
-const archiver = require('archiver');
+// archiver removido — cortes agora são concatenados em 1 MP4
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
