@@ -455,14 +455,37 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
   const moving = !!config.moving;
   const movingSpeed = clamp(num(config.movingSpeed, 20), 1, 100);
   const overlayWidthPct = config.overlayWidthPct != null ? clamp(num(config.overlayWidthPct, 20), 1, 100) : null;
+  const hintWidth = int(config.hintWidth, 0);
+  const hintHeight = int(config.hintHeight, 0);
 
   // probe
   const tProbe = Date.now();
   let videoInfo;
   try { videoInfo = await probeVideoInfo(videoFile.path); }
   catch (e) { throw new Error(`Falha ao analisar o vídeo: ${e.message}`); }
+
+  // Browser hint wins when it disagrees with ffprobe orientation. iPhone .MOV
+  // sometimes lacks the rotation tag/Display Matrix and ffprobe reports the raw
+  // landscape pixels even though the actual visible video is portrait. The
+  // browser's videoWidth/videoHeight always reflect the real displayed pixels.
+  if (hintWidth > 0 && hintHeight > 0) {
+    const probeIsPortrait = videoInfo.height > videoInfo.width;
+    const hintIsPortrait = hintHeight > hintWidth;
+    if (probeIsPortrait !== hintIsPortrait) {
+      log(`↻ orientation override: probe=${videoInfo.width}x${videoInfo.height} hint=${hintWidth}x${hintHeight} → swapping`);
+      videoInfo = {
+        ...videoInfo,
+        width: videoInfo.height,
+        height: videoInfo.width,
+        // Force a 90° rotation so buildScaledVideoArgs physically rotates the
+        // pixels to match what the browser displayed.
+        rotation: videoInfo.rotation === 0 ? 90 : videoInfo.rotation,
+      };
+    }
+  }
+
   const outputSize = fitDimensionsWithinBounds(videoInfo.width, videoInfo.height, maxDim);
-  log(`🔍 probe (${Date.now() - tProbe}ms): raw=${videoInfo.rawWidth}x${videoInfo.rawHeight} display=${videoInfo.width}x${videoInfo.height} rotation=${videoInfo.rotation} hasAudio=${videoInfo.hasAudio} -> ${outputSize.width}x${outputSize.height}`);
+  log(`🔍 probe (${Date.now() - tProbe}ms): raw=${videoInfo.rawWidth}x${videoInfo.rawHeight} display=${videoInfo.width}x${videoInfo.height} rotation=${videoInfo.rotation} hint=${hintWidth}x${hintHeight} hasAudio=${videoInfo.hasAudio} -> ${outputSize.width}x${outputSize.height}`);
 
   // base scale
   const basePath = path.join(TMP_DIR, `base_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.mp4`);
@@ -867,10 +890,13 @@ function buildScaledVideoArgs({ inputPath, outPath, width, height, rotation, has
   const args = ['-y', '-i', inputPath, '-map', '0:v:0'];
   const filters = [];
   const normRotation = normalizeRotation(rotation);
-  if (normRotation === 90) filters.push('transpose=clock');
-  else if (normRotation === 270) filters.push('transpose=cclock');
-  else if (normRotation === 180) filters.push('hflip,vflip');
-  filters.push(`scale=${width}:${height}:flags=lanczos`);
+  // FFmpeg already applies MOV/MP4 display-matrix rotation by default before
+  // running -vf. Adding a manual transpose here double-rotates (or cancels)
+  // iPhone portrait videos, making the final result horizontal. We only use
+  // the probed rotation to compute the target display size; FFmpeg handles the
+  // physical autorotation during decode.
+  if (normRotation) filters.push('setsar=1');
+  filters.push(`scale=${width}:${height}:flags=lanczos,setsar=1`);
   if (hasAudio) args.push('-map', '0:a:0?');
   args.push(
     '-vf', filters.join(','),
