@@ -916,8 +916,12 @@ function fitDimensionsWithinBounds(width, height, maxDim) {
 function makeEven(value) { const r = Math.max(2, Math.round(value)); return r % 2 === 0 ? r : r - 1; }
 
 async function probeVideoInfo(videoPath) {
+  // Include side_data_list so we can detect Display Matrix rotation (iPhone .MOV
+  // is often stored as landscape pixels + a 90° rotation tag). Without honoring
+  // that, scale=W:H produces a squashed/stretched output.
   const { stdout } = await runCommand('ffprobe', [
-    '-v', 'error', '-show_entries', 'stream=index,codec_type,width,height',
+    '-v', 'error',
+    '-show_entries', 'stream=index,codec_type,width,height,tags,side_data_list',
     '-of', 'json', videoPath,
   ], { silent: true });
   let data = {};
@@ -925,8 +929,25 @@ async function probeVideoInfo(videoPath) {
   const streams = Array.isArray(data?.streams) ? data.streams : [];
   const v = streams.find((s) => s.codec_type === 'video');
   const a = streams.find((s) => s.codec_type === 'audio');
-  const width = int(v?.width, 0); const height = int(v?.height, 0);
+  let width = int(v?.width, 0); let height = int(v?.height, 0);
   if (!width || !height) throw new Error('Não foi possível identificar dimensões');
+
+  // Detect rotation from either the rotate tag or Display Matrix side data.
+  let rotation = 0;
+  const rotateTag = parseInt(v?.tags?.rotate ?? '', 10);
+  if (Number.isFinite(rotateTag)) rotation = rotateTag;
+  const sideData = Array.isArray(v?.side_data_list) ? v.side_data_list : [];
+  for (const sd of sideData) {
+    if (sd?.rotation != null && Number.isFinite(Number(sd.rotation))) {
+      rotation = Number(sd.rotation);
+      break;
+    }
+  }
+  // Normalize to 0/90/180/270
+  const norm = ((Math.round(rotation) % 360) + 360) % 360;
+  if (norm === 90 || norm === 270) {
+    [width, height] = [height, width];
+  }
   return { width, height, hasAudio: !!a };
 }
 
