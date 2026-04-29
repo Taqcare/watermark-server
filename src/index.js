@@ -462,7 +462,7 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
   try { videoInfo = await probeVideoInfo(videoFile.path); }
   catch (e) { throw new Error(`Falha ao analisar o vídeo: ${e.message}`); }
   const outputSize = fitDimensionsWithinBounds(videoInfo.width, videoInfo.height, maxDim);
-  log(`🔍 probe (${Date.now() - tProbe}ms): ${videoInfo.width}x${videoInfo.height} hasAudio=${videoInfo.hasAudio} -> ${outputSize.width}x${outputSize.height}`);
+  log(`🔍 probe (${Date.now() - tProbe}ms): raw=${videoInfo.rawWidth}x${videoInfo.rawHeight} display=${videoInfo.width}x${videoInfo.height} rotation=${videoInfo.rotation} hasAudio=${videoInfo.hasAudio} -> ${outputSize.width}x${outputSize.height}`);
 
   // base scale
   const basePath = path.join(TMP_DIR, `base_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.mp4`);
@@ -471,7 +471,7 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
   try {
     await runFfmpeg(buildScaledVideoArgs({
       inputPath: videoFile.path, outPath: basePath,
-      width: outputSize.width, height: outputSize.height, hasAudio: videoInfo.hasAudio,
+      width: outputSize.width, height: outputSize.height, rotation: videoInfo.rotation, hasAudio: videoInfo.hasAudio,
     }), { tag: `${jobId}/prepare-video` });
   } catch (e) { throw new Error(`Falha ao escalar vídeo: ${e.message}`); }
   log(`✅ prepare-video (${Date.now() - tBase}ms): ${(safeSize(basePath) / 1024 / 1024).toFixed(2)}MB`);
@@ -863,13 +863,20 @@ function downloadToFile(url, destPath, maxBytes, redirectsLeft = 5) {
   });
 }
 
-function buildScaledVideoArgs({ inputPath, outPath, width, height, hasAudio }) {
+function buildScaledVideoArgs({ inputPath, outPath, width, height, rotation, hasAudio }) {
   const args = ['-y', '-i', inputPath, '-map', '0:v:0'];
+  const filters = [];
+  const normRotation = normalizeRotation(rotation);
+  if (normRotation === 90) filters.push('transpose=clock');
+  else if (normRotation === 270) filters.push('transpose=cclock');
+  else if (normRotation === 180) filters.push('hflip,vflip');
+  filters.push(`scale=${width}:${height}:flags=lanczos`);
   if (hasAudio) args.push('-map', '0:a:0?');
   args.push(
-    '-vf', `scale=${width}:${height}:flags=lanczos`,
+    '-vf', filters.join(','),
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
     '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+    '-metadata:s:v:0', 'rotate=0',
     '-max_muxing_queue_size', '1024',
   );
   if (hasAudio) args.push('-c:a', 'aac', '-b:a', '160k');
@@ -914,6 +921,7 @@ function fitDimensionsWithinBounds(width, height, maxDim) {
   };
 }
 function makeEven(value) { const r = Math.max(2, Math.round(value)); return r % 2 === 0 ? r : r - 1; }
+function normalizeRotation(rotation) { return ((Math.round(num(rotation, 0)) % 360) + 360) % 360; }
 
 async function probeVideoInfo(videoPath) {
   // Include side_data_list so we can detect Display Matrix rotation (iPhone .MOV
@@ -931,6 +939,8 @@ async function probeVideoInfo(videoPath) {
   const a = streams.find((s) => s.codec_type === 'audio');
   let width = int(v?.width, 0); let height = int(v?.height, 0);
   if (!width || !height) throw new Error('Não foi possível identificar dimensões');
+  const rawWidth = width;
+  const rawHeight = height;
 
   // Detect rotation from either the rotate tag or Display Matrix side data.
   let rotation = 0;
@@ -944,11 +954,11 @@ async function probeVideoInfo(videoPath) {
     }
   }
   // Normalize to 0/90/180/270
-  const norm = ((Math.round(rotation) % 360) + 360) % 360;
+  const norm = normalizeRotation(rotation);
   if (norm === 90 || norm === 270) {
     [width, height] = [height, width];
   }
-  return { width, height, hasAudio: !!a };
+  return { width, height, rawWidth, rawHeight, rotation: norm, hasAudio: !!a };
 }
 
 function overlayPositionExpr({ position, paddingPct, moving, movingSpeed }) {
