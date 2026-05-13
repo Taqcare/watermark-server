@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Instala FFmpeg nativo
 RUN apt-get update \
