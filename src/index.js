@@ -455,6 +455,7 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
   const moving = !!config.moving;
   const movingSpeed = clamp(num(config.movingSpeed, 20), 1, 100);
   const overlayWidthPct = config.overlayWidthPct != null ? clamp(num(config.overlayWidthPct, 20), 1, 100) : null;
+  const delaySeconds = clamp(num(config.delaySeconds, 0), 0, 3600);
   const hintWidth = int(config.hintWidth, 0);
   const hintHeight = int(config.hintHeight, 0);
 
@@ -524,7 +525,7 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
   try {
     await runFfmpeg(buildOverlayCompositeArgs({
       videoPath: basePath, overlayPath: preparedOverlayPath, outPath,
-      position, paddingPct, moving, movingSpeed, hasAudio: videoInfo.hasAudio,
+      position, paddingPct, moving, movingSpeed, delaySeconds, hasAudio: videoInfo.hasAudio,
     }), { tag: `${jobId}/composite` });
   } catch (e) { throw new Error(`Falha ao compor overlay: ${e.message}`); }
 
@@ -917,12 +918,14 @@ function buildOverlayPrepArgs({ inputPath, outPath, opacity, width }) {
   return ['-y', '-i', inputPath, '-vf', filterParts.join(','), '-frames:v', '1', outPath];
 }
 
-function buildOverlayCompositeArgs({ videoPath, overlayPath, outPath, position, paddingPct, moving, movingSpeed, hasAudio }) {
+function buildOverlayCompositeArgs({ videoPath, overlayPath, outPath, position, paddingPct, moving, movingSpeed, delaySeconds, hasAudio }) {
   if (!overlayPath) {
     return ['-y', '-i', videoPath, '-c', 'copy', '-movflags', '+faststart', outPath];
   }
   const { xExpr, yExpr } = overlayPositionExpr({ position, paddingPct, moving, movingSpeed });
-  const filterComplex = `[0:v][1:v]overlay=x='${xExpr}':y='${yExpr}':eof_action=pass:format=auto[outv]`;
+  // Se delaySeconds > 0, o overlay só aparece após N segundos via `enable`
+  const enableExpr = delaySeconds > 0 ? `:enable='gte(t,${delaySeconds})'` : '';
+  const filterComplex = `[0:v][1:v]overlay=x='${xExpr}':y='${yExpr}':eof_action=pass:format=auto${enableExpr}[outv]`;
   const args = [
     '-y', '-i', videoPath, '-loop', '1', '-i', overlayPath,
     '-filter_complex', filterComplex, '-map', '[outv]',
