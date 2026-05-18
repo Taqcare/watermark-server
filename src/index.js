@@ -496,6 +496,7 @@ async function runPipeline(jobId, videoFile, overlayFile, config) {
     await runFfmpeg(buildScaledVideoArgs({
       inputPath: videoFile.path, outPath: basePath,
       width: outputSize.width, height: outputSize.height, rotation: videoInfo.rotation, hasAudio: videoInfo.hasAudio,
+      isHDR: videoInfo.isHDR,
     }), { tag: `${jobId}/prepare-video` });
   } catch (e) { throw new Error(`Falha ao escalar vídeo: ${e.message}`); }
   log(`✅ prepare-video (${Date.now() - tBase}ms): ${(safeSize(basePath) / 1024 / 1024).toFixed(2)}MB`);
@@ -656,12 +657,19 @@ async function runCensorPipeline(jobId, videoFile, params) {
       + `if(gt(X,${W2 - r})*gt(Y,${H2 - r}),if(${inCircle(cx4, cy4)},255,0),255))))`
     : `255`;
 
+  let scaleFilter = '';
+  if (videoInfo.isHDR) {
+    scaleFilter = `zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=${W}:${H}:out_color_matrix=bt709:out_range=tv:flags=lanczos`;
+  } else {
+    scaleFilter = `scale=${W}:${H}:out_color_matrix=bt709:out_range=tv:flags=lanczos`;
+  }
+
   // Pipeline:
   //   1. Escala fonte para WxH (resolução final, exatamente igual ao output) e divide.
   //   2. Recorta a região, aplica filtro (blur/pixel) e adiciona alpha arredondada via geq.
   //   3. Overlay com format=auto preserva alpha (composição correta dos cantos).
   const filterComplex = [
-    `[0:v]scale=${W}:${H}:flags=lanczos,split=2[full][rgn]`,
+    `[0:v]${scaleFilter},split=2[full][rgn]`,
     `[rgn]crop=${rw}:${rh}:${rx}:${ry},${regionFilter},format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='${alphaExpr}'[censored]`,
     `[full][censored]overlay=${rx}:${ry}:format=auto[outv]`,
   ].join(';');
@@ -674,7 +682,7 @@ async function runCensorPipeline(jobId, videoFile, params) {
   args.push(
     '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
     '-pix_fmt', 'yuv420p',
-    '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
+    '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', '-color_range', 'tv',
     '-movflags', '+faststart',
     '-max_muxing_queue_size', '1024',
   );
@@ -746,6 +754,14 @@ async function runCutPipeline(jobId, videoFile, segments) {
     const segOut = path.join(TMP_DIR, `cut_${jobId}_${i + 1}_${crypto.randomBytes(3).toString('hex')}.mp4`);
     job.cleanupPaths.push(segOut);
 
+    const isHDR = probeInfo.isHDR;
+    let vfFilter = '';
+    if (isHDR) {
+      vfFilter = 'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=out_color_matrix=bt709:out_range=tv';
+    } else {
+      vfFilter = 'scale=out_color_matrix=bt709:out_range=tv';
+    }
+
     const args = [
       '-y',
       '-ss', seg.start.toFixed(3),
@@ -755,9 +771,10 @@ async function runCutPipeline(jobId, videoFile, segments) {
     ];
     if (probeInfo.hasAudio) args.push('-map', '0:a:0?');
     args.push(
+      '-vf', vfFilter,
       '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
       '-pix_fmt', 'yuv420p',
-      '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
+      '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', '-color_range', 'tv',
       '-movflags', '+faststart',
       '-max_muxing_queue_size', '1024',
     );
@@ -891,23 +908,27 @@ function downloadToFile(url, destPath, maxBytes, redirectsLeft = 5) {
   });
 }
 
-function buildScaledVideoArgs({ inputPath, outPath, width, height, rotation, hasAudio }) {
+function buildScaledVideoArgs({ inputPath, outPath, width, height, rotation, hasAudio, isHDR }) {
   const args = ['-y', '-i', inputPath, '-map', '0:v:0'];
   const filters = [];
   const normRotation = normalizeRotation(rotation);
-  // FFmpeg already applies MOV/MP4 display-matrix rotation by default before
-  // running -vf. Adding a manual transpose here double-rotates (or cancels)
-  // iPhone portrait videos, making the final result horizontal. We only use
-  // the probed rotation to compute the target display size; FFmpeg handles the
-  // physical autorotation during decode.
+  
   if (normRotation) filters.push('setsar=1');
-  filters.push(`scale=${width}:${height}:flags=lanczos,setsar=1`);
+  
+  if (isHDR) {
+    // Aplica o tone mapping HDR -> SDR em float e depois converte de volta a yuv420p
+    filters.push('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p');
+  }
+  
+  // Realiza o redimensionamento forçando a matriz de cor BT.709 e amplitude limitada (TV)
+  filters.push(`scale=${width}:${height}:out_color_matrix=bt709:out_range=tv:flags=lanczos,setsar=1`);
+  
   if (hasAudio) args.push('-map', '0:a:0?');
   args.push(
     '-vf', filters.join(','),
     '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
     '-pix_fmt', 'yuv420p', 
-    '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
+    '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', '-color_range', 'tv',
     '-movflags', '+faststart',
     '-map_metadata', '0',
     '-metadata:s:v:0', 'rotate=0',
@@ -967,7 +988,7 @@ async function probeVideoInfo(videoPath) {
   // that, scale=W:H produces a squashed/stretched output.
   const { stdout } = await runCommand('ffprobe', [
     '-v', 'error',
-    '-show_entries', 'stream=index,codec_type,width,height,tags,side_data_list',
+    '-show_entries', 'stream=index,codec_type,width,height,pix_fmt,color_space,color_transfer,color_primaries,tags,side_data_list',
     '-of', 'json', videoPath,
   ], { silent: true });
   let data = {};
@@ -996,7 +1017,13 @@ async function probeVideoInfo(videoPath) {
   if (norm === 90 || norm === 270) {
     [width, height] = [height, width];
   }
-  return { width, height, rawWidth, rawHeight, rotation: norm, hasAudio: !!a };
+
+  // Detect HDR
+  const colorTransfer = v?.color_transfer || '';
+  const pixFmt = v?.pix_fmt || '';
+  const isHDR = colorTransfer.includes('arib-std-b67') || colorTransfer.includes('smpte2084') || pixFmt.includes('10');
+
+  return { width, height, rawWidth, rawHeight, rotation: norm, hasAudio: !!a, isHDR };
 }
 
 function overlayPositionExpr({ position, paddingPct, moving, movingSpeed }) {
