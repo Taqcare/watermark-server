@@ -672,11 +672,13 @@ async function runCensorPipeline(jobId, videoFile, params) {
   const args = ['-y', '-i', videoFile.path, '-filter_complex', filterComplex, '-map', '[outv]'];
   if (videoInfo.hasAudio) args.push('-map', '0:a:0?');
   args.push(
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-    '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+    '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+    '-pix_fmt', 'yuv420p',
+    '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
+    '-movflags', '+faststart',
     '-max_muxing_queue_size', '1024',
   );
-  if (videoInfo.hasAudio) args.push('-c:a', 'aac', '-b:a', '160k');
+  if (videoInfo.hasAudio) args.push('-c:a', 'aac', '-b:a', '192k');
   else args.push('-an');
   args.push('-threads', '2', outPath);
 
@@ -753,11 +755,13 @@ async function runCutPipeline(jobId, videoFile, segments) {
     ];
     if (probeInfo.hasAudio) args.push('-map', '0:a:0?');
     args.push(
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-      '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+      '-pix_fmt', 'yuv420p',
+      '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
+      '-movflags', '+faststart',
       '-max_muxing_queue_size', '1024',
     );
-    if (probeInfo.hasAudio) args.push('-c:a', 'aac', '-b:a', '160k');
+    if (probeInfo.hasAudio) args.push('-c:a', 'aac', '-b:a', '192k');
     else args.push('-an');
     args.push('-threads', '2', segOut);
 
@@ -901,12 +905,15 @@ function buildScaledVideoArgs({ inputPath, outPath, width, height, rotation, has
   if (hasAudio) args.push('-map', '0:a:0?');
   args.push(
     '-vf', filters.join(','),
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-    '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+    '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+    '-pix_fmt', 'yuv420p', 
+    '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
+    '-movflags', '+faststart',
+    '-map_metadata', '0',
     '-metadata:s:v:0', 'rotate=0',
     '-max_muxing_queue_size', '1024',
   );
-  if (hasAudio) args.push('-c:a', 'aac', '-b:a', '160k');
+  if (hasAudio) args.push('-c:a', 'aac', '-b:a', '192k');
   else args.push('-an');
   args.push('-threads', '2', outPath);
   return args;
@@ -932,11 +939,13 @@ function buildOverlayCompositeArgs({ videoPath, overlayPath, outPath, position, 
   ];
   if (hasAudio) args.push('-map', '0:a:0?');
   args.push(
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '20',
-    '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+    '-c:v', 'libx264', '-preset', 'fast', '-crf', '17',
+    '-pix_fmt', 'yuv420p', 
+    '-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709',
+    '-movflags', '+faststart',
     '-max_muxing_queue_size', '1024',
   );
-  if (hasAudio) args.push('-c:a', 'aac', '-b:a', '160k');
+  if (hasAudio) args.push('-c:a', 'aac', '-b:a', '192k');
   else args.push('-an');
   args.push('-shortest', '-threads', '2', outPath);
   return args;
